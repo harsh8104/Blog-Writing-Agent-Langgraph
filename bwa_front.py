@@ -7,7 +7,7 @@ import zipfile
 from datetime import date
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, Optional, List,Tuple
+from typing import Any, Dict, Optional, List, Tuple
 
 import pandas as pd
 import requests
@@ -61,6 +61,30 @@ def call_generate_stream(api_base: str, topic: str, as_of: str):
     with requests.post(
         f"{api_base.rstrip('/')}/generate/stream",
         json={"topic": topic, "as_of": as_of},
+        timeout=600,
+        stream=True,
+    ) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            yield json.loads(line)
+
+
+def call_generate_plan(api_base: str, topic: str, as_of: str) -> Dict[str, Any]:
+    resp = requests.post(
+        f"{api_base.rstrip('/')}/generate/plan",
+        json={"topic": topic, "as_of": as_of},
+        timeout=600,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def call_generate_continue_stream(api_base: str, payload: Dict[str, Any]):
+    with requests.post(
+        f"{api_base.rstrip('/')}/generate/continue/stream",
+        json=payload,
         timeout=600,
         stream=True,
     ) as resp:
@@ -183,7 +207,7 @@ with st.sidebar:
     )
     as_of = st.date_input("As-of date", value=date.today())
     api_base = st.text_input("API base URL", value="http://localhost:8000")
-    run_btn = st.button("🚀 Generate Blog", type="primary")
+    run_btn = st.button("🚀 Generate Plan", type="primary")
 
     # ✅ NEW: Past blogs list (keeps everything else intact)
     st.divider()
@@ -238,6 +262,10 @@ if "topic_prefill" in st.session_state and isinstance(st.session_state["topic_pr
 # Storage for latest run
 if "last_out" not in st.session_state:
     st.session_state["last_out"] = None
+if "pending_plan" not in st.session_state:
+    st.session_state["pending_plan"] = None
+if "pending_context" not in st.session_state:
+    st.session_state["pending_context"] = None
 
 # Layout
 tab_plan, tab_evidence, tab_preview, tab_images, tab_logs = st.tabs(
@@ -256,33 +284,27 @@ if run_btn:
         st.warning("Please enter a topic.")
         st.stop()
 
-    status = st.status("Calling API…", expanded=True)
+    status = st.status("Generating plan…", expanded=True)
     try:
-        final_out = None
-        for event in call_generate_stream(api_base, topic.strip(), as_of.isoformat()):
-            if event.get("event") == "node":
-                node = event.get("node", "unknown")
-                status.update(label=f"Running: {node}…", state="running", expanded=True)
-                log(f"[node] {node}")
-            elif event.get("event") == "final":
-                final_out = event.get("data")
-                break
-            elif event.get("event") == "error":
-                raise RuntimeError(event.get("message", "Unknown error"))
-
-        if final_out is None:
-            raise RuntimeError("No final result received from stream.")
-
-        st.session_state["last_out"] = final_out
-        status.update(label="✅ Done", state="complete", expanded=False)
-        log("[final] received final state")
-        log(f"[final] {json.dumps(final_out, default=str)[:1200]}")
+        plan_out = call_generate_plan(api_base, topic.strip(), as_of.isoformat())
+        st.session_state["pending_plan"] = plan_out
+        st.session_state["pending_context"] = {
+            "topic": topic.strip(),
+            "as_of": as_of.isoformat(),
+        }
+        st.session_state["last_out"] = None
+        status.update(label="✅ Plan ready (awaiting approval)", state="complete", expanded=False)
+        log("[plan] received plan")
+        log(f"[plan] {json.dumps(plan_out, default=str)[:1200]}")
     except Exception as e:
         status.update(label="❌ Failed", state="error", expanded=True)
         st.error(f"API call failed: {e}")
 
-# Render last result (if any)
-out = st.session_state.get("last_out")
+def _selected_output() -> Optional[Dict[str, Any]]:
+    return st.session_state.get("last_out") or st.session_state.get("pending_plan")
+
+
+out = _selected_output()
 if out:
     # --- Plan tab ---
     with tab_plan:
@@ -419,5 +441,65 @@ if out:
             st.session_state["logs"].extend(logs)
 
         st.text_area("Event log", value="\n\n".join(st.session_state["logs"][-80:]), height=520)
+pending_plan = st.session_state.get("pending_plan")
+pending_context = st.session_state.get("pending_context")
+
+if pending_plan and pending_context:
+    st.markdown("---")
+    st.subheader("Human approval")
+    col_approve, col_regen = st.columns(2)
+    with col_approve:
+        if st.button("✅ Approve plan and generate blog"):
+            status = st.status("Generating blog…", expanded=True)
+            try:
+                payload = {
+                    "topic": pending_context["topic"],
+                    "as_of": pending_context["as_of"],
+                    "mode": pending_plan.get("mode"),
+                    "needs_research": pending_plan.get("needs_research"),
+                    "queries": pending_plan.get("queries"),
+                    "recency_days": pending_plan.get("recency_days"),
+                    "plan": pending_plan.get("plan"),
+                    "evidence": pending_plan.get("evidence"),
+                }
+
+                final_out = None
+                for event in call_generate_continue_stream(api_base, payload):
+                    if event.get("event") == "node":
+                        node = event.get("node", "unknown")
+                        status.update(label=f"Running: {node}…", state="running", expanded=True)
+                        log(f"[node] {node}")
+                    elif event.get("event") == "final":
+                        final_out = event.get("data")
+                        break
+                    elif event.get("event") == "error":
+                        raise RuntimeError(event.get("message", "Unknown error"))
+
+                if final_out is None:
+                    raise RuntimeError("No final result received from stream.")
+
+                st.session_state["last_out"] = final_out
+                st.session_state["pending_plan"] = None
+                st.session_state["pending_context"] = None
+                status.update(label="✅ Done", state="complete", expanded=False)
+                log("[final] received final state")
+                log(f"[final] {json.dumps(final_out, default=str)[:1200]}")
+                st.rerun()
+            except Exception as e:
+                status.update(label="❌ Failed", state="error", expanded=True)
+                st.error(f"API call failed: {e}")
+
+    with col_regen:
+        if st.button("🔁 Regenerate plan"):
+            status = st.status("Regenerating plan…", expanded=True)
+            try:
+                plan_out = call_generate_plan(api_base, pending_context["topic"], pending_context["as_of"])
+                st.session_state["pending_plan"] = plan_out
+                status.update(label="✅ Plan updated", state="complete", expanded=False)
+                log("[plan] regenerated plan")
+                st.rerun()
+            except Exception as e:
+                status.update(label="❌ Failed", state="error", expanded=True)
+                st.error(f"API call failed: {e}")
 else:
-    st.info("Enter a topic and click **Generate Blog**.")
+    st.info("Enter a topic and click **Generate Plan**.")
